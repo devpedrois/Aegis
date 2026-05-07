@@ -1,0 +1,6 @@
+bin/
+.cache/
+*.exe
+.env
+*.pem
+*.key
