@@ -7,9 +7,13 @@ import (
 	"strings"
 )
 
-var lookupHost = net.LookupHost
+type hostLookupFunc func(string) ([]string, error)
 
 func Validate(cfg *Config) error {
+	return validateWithHostLookup(cfg, net.LookupHost)
+}
+
+func validateWithHostLookup(cfg *Config, lookupHost hostLookupFunc) error {
 	if cfg == nil {
 		return fmt.Errorf("config must not be nil")
 	}
@@ -59,7 +63,7 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("backend weight must be greater than zero")
 		}
 
-		if err := validateBackendURL(cfg, &cfg.Backends[i]); err != nil {
+		if err := validateBackendURL(cfg, &cfg.Backends[i], lookupHost); err != nil {
 			return fmt.Errorf("backend %q failed validation: %w", cfg.Backends[i].URL, err)
 		}
 	}
@@ -67,7 +71,7 @@ func Validate(cfg *Config) error {
 	return nil
 }
 
-func validateBackendURL(cfg *Config, backend *BackendConfig) error {
+func validateBackendURL(cfg *Config, backend *BackendConfig, lookupHost hostLookupFunc) error {
 	parsedURL, err := url.Parse(backend.URL)
 	if err != nil {
 		return fmt.Errorf("parse backend URL: %w", err)

@@ -12,6 +12,7 @@ import (
 	"github.com/user/aegis/internal/config"
 	"github.com/user/aegis/internal/pool"
 	"github.com/user/aegis/internal/proxy"
+	"github.com/user/aegis/internal/ratelimit"
 )
 
 const version = "0.1.0"
@@ -82,10 +83,14 @@ func run(args []string) error {
 
 	pool.StartHealthChecks(ctx, backendPool, cfg.HealthCheck)
 	proxyHandler := proxy.NewProxyHandler(backendPool)
+	rateLimiter := ratelimit.NewRateLimiter(cfg.RateLimit.RequestsPerSecond, float64(cfg.RateLimit.Burst))
+	ratelimit.StartCleanup(ctx, rateLimiter, cfg.RateLimit.CleanupInterval)
+	// [SECURITY] Rate limiting is enforced at the HTTP edge so abusive clients are rejected before backend resources are consumed.
+	handler := rateLimiter.Middleware(proxyHandler)
 
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.Server.Port),
-		Handler:        proxyHandler,
+		Handler:        handler,
 		ReadTimeout:    cfg.Server.ReadTimeout,  // [SECURITY] Slowloris protection at the edge.
 		WriteTimeout:   cfg.Server.WriteTimeout, // [SECURITY] Slow read protection limits resource exhaustion.
 		IdleTimeout:    cfg.Server.IdleTimeout,

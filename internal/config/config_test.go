@@ -60,20 +60,16 @@ tui:
 func TestValidatePinsResolvedBackendAddress(t *testing.T) {
 	t.Parallel()
 
-	originalLookupHost := lookupHost
-	lookupHost = func(host string) ([]string, error) {
+	lookupHost := func(host string) ([]string, error) {
 		return []string{"203.0.113.20"}, nil
 	}
-	t.Cleanup(func() {
-		lookupHost = originalLookupHost
-	})
 
 	cfg := NewDefaultConfig()
 	cfg.Backends = []BackendConfig{
 		{URL: "http://proxy.example.com:8081", Weight: 1},
 	}
 
-	if err := Validate(cfg); err != nil {
+	if err := validateWithHostLookup(cfg, lookupHost); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
 
