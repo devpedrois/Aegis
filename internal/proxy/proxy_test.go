@@ -3,8 +3,10 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
+
+	"github.com/user/aegis/internal/config"
+	"github.com/user/aegis/internal/pool"
 )
 
 func TestProxyHandlerUsesPinnedDialAddress(t *testing.T) {
@@ -18,27 +20,20 @@ func TestProxyHandlerUsesPinnedDialAddress(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	backendURL, err := url.Parse("http://backend.example.com")
-	if err != nil {
-		t.Fatalf("url.Parse() error = %v", err)
-	}
-
-	pinnedURL, err := url.Parse(backend.URL)
-	if err != nil {
-		t.Fatalf("url.Parse() error = %v", err)
-	}
-
-	handler, err := NewProxyHandler([]Target{
+	backendPool, err := pool.NewPool([]config.BackendConfig{
 		{
-			URL:         backendURL,
-			HostHeader:  "backend.example.com",
-			DialAddress: pinnedURL.Host,
-			ServerName:  "backend.example.com",
+			URL:           "http://backend.example.com",
+			Weight:        1,
+			PinnedAddress: backend.Listener.Addr().String(),
+			ServerName:    "backend.example.com",
+			OriginalHost:  "backend.example.com",
 		},
-	})
+	}, NewDirector)
 	if err != nil {
-		t.Fatalf("NewProxyHandler() error = %v", err)
+		t.Fatalf("NewPool() error = %v", err)
 	}
+
+	handler := NewProxyHandler(backendPool)
 
 	req := httptest.NewRequest(http.MethodGet, "http://aegis.local/check", nil)
 	req.RemoteAddr = "203.0.113.10:4567"

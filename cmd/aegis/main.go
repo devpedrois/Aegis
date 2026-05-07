@@ -1,15 +1,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 
 	"github.com/user/aegis/internal/config"
+	"github.com/user/aegis/internal/pool"
 	"github.com/user/aegis/internal/proxy"
 )
 
@@ -71,15 +72,16 @@ func run(args []string) error {
 		cfg.TUI.Enabled = false
 	}
 
-	targets, err := parseBackendTargets(cfg.Backends)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	backendPool, err := pool.NewPool(cfg.Backends, proxy.NewDirector)
 	if err != nil {
 		return err
 	}
 
-	proxyHandler, err := proxy.NewProxyHandler(targets)
-	if err != nil {
-		return err
-	}
+	pool.StartHealthChecks(ctx, backendPool, cfg.HealthCheck)
+	proxyHandler := proxy.NewProxyHandler(backendPool)
 
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.Server.Port),
@@ -90,30 +92,11 @@ func run(args []string) error {
 		MaxHeaderBytes: cfg.Server.MaxHeaderBytes, // [SECURITY] Header size is capped to reduce request abuse.
 	}
 
-	log.Printf("Aegis started on :%d with %d backends", cfg.Server.Port, len(targets))
+	log.Printf("Aegis started on :%d with %d backends", cfg.Server.Port, len(backendPool.GetAll()))
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen and serve: %w", err)
 	}
 
 	return nil
-}
-
-func parseBackendTargets(backends []config.BackendConfig) ([]proxy.Target, error) {
-	targets := make([]proxy.Target, 0, len(backends))
-	for _, backend := range backends {
-		target, err := url.Parse(backend.URL)
-		if err != nil {
-			return nil, fmt.Errorf("parse backend target %q: %w", backend.URL, err)
-		}
-
-		targets = append(targets, proxy.Target{
-			URL:         target,
-			HostHeader:  backend.OriginalHost,
-			DialAddress: backend.PinnedAddress,
-			ServerName:  backend.ServerName,
-		})
-	}
-
-	return targets, nil
 }

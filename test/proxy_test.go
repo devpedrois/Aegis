@@ -5,13 +5,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strings"
 	"testing"
 
 	proxypkg "github.com/user/aegis/internal/proxy"
 )
 
-func TestProxyHandlerRoundRobin(t *testing.T) {
+func TestProxyHandlerUsesHealthyPoolBackends(t *testing.T) {
 	t.Parallel()
 
 	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,33 +24,8 @@ func TestProxyHandlerRoundRobin(t *testing.T) {
 	}))
 	defer backendB.Close()
 
-	backendAURL, err := url.Parse(backendA.URL)
-	if err != nil {
-		t.Fatalf("url.Parse() error = %v", err)
-	}
-
-	backendBURL, err := url.Parse(backendB.URL)
-	if err != nil {
-		t.Fatalf("url.Parse() error = %v", err)
-	}
-
-	handler, err := proxypkg.NewProxyHandler([]proxypkg.Target{
-		{
-			URL:         backendAURL,
-			HostHeader:  backendAURL.Host,
-			DialAddress: backendAURL.Host,
-			ServerName:  backendAURL.Hostname(),
-		},
-		{
-			URL:         backendBURL,
-			HostHeader:  backendBURL.Host,
-			DialAddress: backendBURL.Host,
-			ServerName:  backendBURL.Hostname(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewProxyHandler() error = %v", err)
-	}
+	pool := newHTTPPool(t, []string{backendA.URL, backendB.URL})
+	handler := proxypkg.NewProxyHandler(pool)
 
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -79,46 +54,25 @@ func TestProxyHandlerRoundRobin(t *testing.T) {
 	}
 }
 
-func TestProxyHandlerSetsXForwardedForFromRemoteAddr(t *testing.T) {
+func TestProxyHandlerReturns503WhenNoHealthyBackendExists(t *testing.T) {
 	t.Parallel()
 
-	var receivedXForwardedFor string
+	pool := newTestPool(t, []backendSpec{{name: "a", weight: 1}})
+	pool.MarkUnhealthy("http://a.example")
 
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedXForwardedFor = r.Header.Get("X-Forwarded-For")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer backend.Close()
-
-	backendURL, err := url.Parse(backend.URL)
-	if err != nil {
-		t.Fatalf("url.Parse() error = %v", err)
-	}
-
-	handler, err := proxypkg.NewProxyHandler([]proxypkg.Target{
-		{
-			URL:         backendURL,
-			HostHeader:  backendURL.Host,
-			DialAddress: backendURL.Host,
-			ServerName:  backendURL.Hostname(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewProxyHandler() error = %v", err)
-	}
+	handler := proxypkg.NewProxyHandler(pool)
 
 	req := httptest.NewRequest(http.MethodGet, "http://aegis.local/check", nil)
 	req.RemoteAddr = "203.0.113.10:4567"
-	req.Header.Set("X-Forwarded-For", "198.51.100.99")
 
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("ServeHTTP() status = %d, want %d", recorder.Code, http.StatusOK)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ServeHTTP() status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
 
-	if receivedXForwardedFor != "203.0.113.10" {
-		t.Fatalf("X-Forwarded-For = %q, want %q", receivedXForwardedFor, "203.0.113.10")
+	if got := strings.TrimSpace(recorder.Body.String()); got != `{"error":"no healthy backends"}` {
+		t.Fatalf("ServeHTTP() body = %q, want generic 503 body", got)
 	}
 }

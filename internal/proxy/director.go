@@ -3,13 +3,14 @@ package proxy
 import (
 	"net"
 	"net/http"
+	"net/url"
 )
 
-func newDirector(target Target) func(req *http.Request) {
+func NewDirector(targetURL *url.URL, hostHeader string) func(req *http.Request) {
 	return func(req *http.Request) {
-		req.URL.Scheme = target.URL.Scheme
-		req.URL.Host = target.URL.Host
-		req.Host = target.HostHeader
+		req.URL.Scheme = targetURL.Scheme
+		req.URL.Host = targetURL.Host
+		req.Host = hostHeader
 
 		host, _, err := net.SplitHostPort(req.RemoteAddr)
 		if err == nil {
