@@ -19,7 +19,7 @@ func StartHealthChecks(ctx context.Context, pool *BackendPool, cfg config.Health
 func runHealthCheck(ctx context.Context, backend *Backend, pool *BackendPool, cfg config.HealthCheckConfig) {
 	client := &http.Client{
 		Timeout:   cfg.Timeout,
-		Transport: backend.Proxy.Transport,
+		Transport: backend.HealthCheckTransport,
 	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()

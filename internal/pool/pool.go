@@ -19,9 +19,14 @@ type BackendPool struct {
 	index atomic.Uint64
 }
 
-func NewPool(configs []config.BackendConfig, directorFactory DirectorFactory) (*BackendPool, error) {
+func NewPool(configs []config.BackendConfig, directorFactory DirectorFactory, transportFactories ...TransportFactory) (*BackendPool, error) {
 	if len(configs) == 0 {
 		return nil, fmt.Errorf("at least one backend is required")
+	}
+
+	var transportFactory TransportFactory
+	if len(transportFactories) > 0 {
+		transportFactory = transportFactories[0]
 	}
 
 	backends := make([]*Backend, 0, len(configs))
@@ -38,6 +43,7 @@ func NewPool(configs []config.BackendConfig, directorFactory DirectorFactory) (*
 			backendConfig.ServerName,
 			backendConfig.OriginalHost,
 			directorFactory,
+			transportFactory,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("create backend %q: %w", backendConfig.URL, err)

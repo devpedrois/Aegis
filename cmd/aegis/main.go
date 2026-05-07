@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/user/aegis/internal/config"
+	"github.com/user/aegis/internal/metrics"
 	"github.com/user/aegis/internal/pool"
 	"github.com/user/aegis/internal/proxy"
 	"github.com/user/aegis/internal/ratelimit"
@@ -76,12 +78,16 @@ func run(args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	backendPool, err := pool.NewPool(cfg.Backends, proxy.NewDirector)
+	collector := metrics.NewMetricsCollector(time.Minute, 1000)
+	backendPool, err := pool.NewPool(cfg.Backends, proxy.NewDirector, proxy.NewInstrumentedTransportFactory(collector))
 	if err != nil {
 		return err
 	}
+	collector.SetBackends(backendPool.GetAll())
 
 	pool.StartHealthChecks(ctx, backendPool, cfg.HealthCheck)
+	// [SECURITY] Periodic logs emit backend-level aggregates only, avoiding client-controlled request details in telemetry output.
+	metrics.StartPeriodicLoggingWithLevel(ctx, collector, 10*time.Second, cfg.Logging.Level)
 	proxyHandler := proxy.NewProxyHandler(backendPool)
 	rateLimiter := ratelimit.NewRateLimiter(cfg.RateLimit.RequestsPerSecond, float64(cfg.RateLimit.Burst))
 	ratelimit.StartCleanup(ctx, rateLimiter, cfg.RateLimit.CleanupInterval)
