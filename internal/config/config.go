@@ -23,6 +23,7 @@ type Config struct {
 
 type ServerConfig struct {
 	Port            int           `yaml:"port"`
+	AllowedHosts    []string      `yaml:"allowed_hosts"`
 	ReadTimeout     time.Duration `yaml:"read_timeout"`
 	WriteTimeout    time.Duration `yaml:"write_timeout"`
 	IdleTimeout     time.Duration `yaml:"idle_timeout"`
