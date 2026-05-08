@@ -9,6 +9,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync/atomic"
+
+	"github.com/user/aegis/internal/circuit"
 )
 
 type DirectorFactory func(targetURL *url.URL, hostHeader string) func(*http.Request)
@@ -17,19 +19,20 @@ type TransportFactory func(base *http.Transport, backend *Backend) http.RoundTri
 type Backend struct {
 	URL    *url.URL
 	Weight int
-	// [SECURITY] Backend mutable state uses atomics because requests and health checks run concurrently.
+	// Backend mutable state uses atomics because requests and health checks run concurrently.
 	Healthy atomic.Bool
-	// [SECURITY] Health-check counters stay atomic to avoid races during concurrent state transitions.
+	// Health-check counters stay atomic to avoid races during concurrent state transitions.
 	ConsecFails     atomic.Int32
 	ConsecSuccesses atomic.Int32
 	WarmupLevel     atomic.Int32
-	// [SECURITY] Runtime counters stay atomic because request instrumentation and health monitoring execute concurrently.
+	// Runtime counters stay atomic because request instrumentation and health monitoring execute concurrently.
 	LatencyP50     atomic.Int64
 	LatencyP95     atomic.Int64
 	LatencyP99     atomic.Int64
 	ActiveRequests atomic.Int64
 	TotalRequests  atomic.Int64
 	TotalErrors    atomic.Int64
+	CircuitBreaker *circuit.CircuitBreaker
 	// [SECURITY] Health checks use a dedicated uninstrumented transport so trusted control-plane probes cannot poison client telemetry.
 	HealthCheckTransport http.RoundTripper
 	Proxy                *httputil.ReverseProxy

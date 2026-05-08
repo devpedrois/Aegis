@@ -15,11 +15,14 @@ import (
 )
 
 type MetricsCollector struct {
-	windows    map[string]*SlidingWindow
-	backendMap map[string]*pool.Backend
-	maxAge     time.Duration
-	maxEntries int
-	// [SECURITY] Aggregate metrics state is protected by RWMutex so concurrent requests cannot corrupt shared accounting under load.
+	windows       map[string]*SlidingWindow
+	backendMap    map[string]*pool.Backend
+	maxAge        time.Duration
+	maxEntries    int
+	currentRate   float64
+	blockedIPs    int
+	adaptiveState string
+	// Aggregate metrics state is protected by RWMutex so concurrent requests cannot corrupt shared accounting under load.
 	mu sync.RWMutex
 }
 
@@ -29,7 +32,7 @@ type SlidingWindow struct {
 	count      int
 	maxAge     time.Duration
 	maxEntries int
-	// [SECURITY] Each backend window has its own mutex so attackers cannot race metrics bookkeeping into inconsistent state.
+	// Each backend window has its own mutex so concurrent updates do not corrupt the ring buffer.
 	mu sync.Mutex
 }
 
@@ -97,6 +100,34 @@ func (c *MetricsCollector) Snapshot() MetricsSnapshot {
 	return c.snapshotAt(time.Now())
 }
 
+func (c *MetricsCollector) LatencySamples(backendURL string) []time.Duration {
+	if c == nil || backendURL == "" {
+		return nil
+	}
+
+	c.mu.RLock()
+	window := c.windows[backendURL]
+	c.mu.RUnlock()
+	if window == nil {
+		return nil
+	}
+
+	return window.LatencySamples(time.Now())
+}
+
+func (c *MetricsCollector) SetControlState(currentRate float64, blockedIPs int, adaptiveState string) {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.currentRate = currentRate
+	c.blockedIPs = blockedIPs
+	c.adaptiveState = adaptiveState
+}
+
 func (c *MetricsCollector) recordLatencyAt(backendURL string, latency time.Duration, isError bool, now time.Time) {
 	if c == nil || backendURL == "" {
 		return
@@ -146,6 +177,9 @@ func (c *MetricsCollector) snapshotAt(now time.Time) MetricsSnapshot {
 	for key, window := range c.windows {
 		windowMap[key] = window
 	}
+	currentRate := c.currentRate
+	blockedIPs := c.blockedIPs
+	adaptiveState := c.adaptiveState
 	c.mu.RUnlock()
 
 	urls := make([]string, 0, len(backendMap)+len(windowMap))
@@ -166,8 +200,11 @@ func (c *MetricsCollector) snapshotAt(now time.Time) MetricsSnapshot {
 	sort.Strings(urls)
 
 	snapshot := MetricsSnapshot{
-		Timestamp:    now,
-		BackendStats: make([]BackendSnapshot, 0, len(urls)),
+		Timestamp:     now,
+		BackendStats:  make([]BackendSnapshot, 0, len(urls)),
+		CurrentRate:   currentRate,
+		BlockedIPs:    blockedIPs,
+		AdaptiveState: adaptiveState,
 	}
 
 	for _, backendURL := range urls {
@@ -191,6 +228,9 @@ func (c *MetricsCollector) snapshotAt(now time.Time) MetricsSnapshot {
 			backendSnapshot.ActiveRequests = backend.ActiveRequests.Load()
 			backendSnapshot.TotalRequests = backend.TotalRequests.Load()
 			backendSnapshot.TotalErrors = backend.TotalErrors.Load()
+			if backend.CircuitBreaker != nil {
+				backendSnapshot.CircuitState = backend.CircuitBreaker.State().String()
+			}
 			backend.LatencyP50.Store(windowSnapshot.P50.Microseconds())
 			backend.LatencyP95.Store(windowSnapshot.P95.Microseconds())
 			backend.LatencyP99.Store(windowSnapshot.P99.Microseconds())
@@ -291,6 +331,23 @@ func (w *SlidingWindow) Record(entry LatencyEntry) {
 
 	w.entries[w.start] = entry
 	w.start = (w.start + 1) % w.maxEntries
+}
+
+func (w *SlidingWindow) LatencySamples(now time.Time) []time.Duration {
+	if w == nil {
+		return nil
+	}
+
+	w.mu.Lock()
+	entries := w.filteredEntriesLocked(now)
+	w.mu.Unlock()
+
+	samples := make([]time.Duration, 0, len(entries))
+	for _, entry := range entries {
+		samples = append(samples, entry.Latency)
+	}
+
+	return samples
 }
 
 func (w *SlidingWindow) Snapshot(now time.Time) WindowSnapshot {

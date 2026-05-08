@@ -223,6 +223,50 @@ func TestMetricsCollectorSnapshotHandlesEmptyState(t *testing.T) {
 	}
 }
 
+func TestMetricsCollectorSnapshotIncludesCircuitState(t *testing.T) {
+	t.Parallel()
+
+	pool := newTestPool(t, []backendSpec{{name: "a", weight: 1}})
+	backend := pool.GetAll()[0]
+	backend.CircuitBreaker = newTestBreaker(time.Second, 1, 2, 2)
+	backend.CircuitBreaker.RecordFailure()
+
+	collector := metricspkg.NewMetricsCollector(time.Minute, 1000)
+	collector.SetBackends(pool.GetAll())
+
+	snapshot := collector.Snapshot()
+	if len(snapshot.BackendStats) != 1 {
+		t.Fatalf("len(BackendStats) = %d, want %d", len(snapshot.BackendStats), 1)
+	}
+
+	if got := snapshot.BackendStats[0].CircuitState; got != "open" {
+		t.Fatalf("CircuitState = %q, want %q", got, "open")
+	}
+}
+
+func TestMetricsCollectorSnapshotConcurrentWithControlStateUpdates(t *testing.T) {
+	t.Parallel()
+
+	collector := metricspkg.NewMetricsCollector(time.Minute, 1000)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+
+		go func(index int) {
+			defer wg.Done()
+			collector.SetControlState(float64(index), index, "normal")
+		}(i)
+
+		go func() {
+			defer wg.Done()
+			_ = collector.Snapshot()
+		}()
+	}
+
+	wg.Wait()
+}
+
 func TestStartPeriodicLoggingEmitsAggregateMetrics(t *testing.T) {
 	pool := newTestPool(t, []backendSpec{{name: "a", weight: 1}})
 	backend := pool.GetAll()[0]

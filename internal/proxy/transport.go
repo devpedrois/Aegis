@@ -46,6 +46,10 @@ func (t *InstrumentedTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if err != nil {
 		if t.backend != nil {
 			t.backend.TotalErrors.Add(1)
+			if t.backend.CircuitBreaker != nil {
+				// [SECURITY] Upstream dial and transport errors count as backend failures because repeated connection faults indicate an unsafe target.
+				t.backend.CircuitBreaker.RecordFailure()
+			}
 		}
 
 		if t.collector != nil && t.backend != nil && t.backend.URL != nil {
@@ -59,6 +63,12 @@ func (t *InstrumentedTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if t.backend != nil {
 		if isError {
 			t.backend.TotalErrors.Add(1)
+			if t.backend.CircuitBreaker != nil {
+				// [SECURITY] Upstream 5xx responses trip failure accounting so broken nodes can be isolated before they cause cascade failure.
+				t.backend.CircuitBreaker.RecordFailure()
+			}
+		} else if t.backend.CircuitBreaker != nil {
+			t.backend.CircuitBreaker.RecordSuccess()
 		}
 
 		t.backend.TotalRequests.Add(1)

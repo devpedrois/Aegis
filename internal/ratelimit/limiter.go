@@ -74,6 +74,10 @@ func (rl *RateLimiter) SetGlobalRate(rate float64) {
 	})
 }
 
+func (rl *RateLimiter) CurrentRate() float64 {
+	return rl.currentRate()
+}
+
 func (rl *RateLimiter) BlockedCount() int {
 	count := 0
 	rl.buckets.Range(func(_, value any) bool {

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/user/aegis/internal/circuit"
 	"github.com/user/aegis/internal/config"
 	"github.com/user/aegis/internal/metrics"
 	"github.com/user/aegis/internal/pool"
@@ -83,6 +84,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	attachCircuitBreakers(backendPool.GetAll(), cfg.CircuitBreaker)
 	collector.SetBackends(backendPool.GetAll())
 
 	pool.StartHealthChecks(ctx, backendPool, cfg.HealthCheck)
@@ -91,6 +93,7 @@ func run(args []string) error {
 	proxyHandler := proxy.NewProxyHandler(backendPool)
 	rateLimiter := ratelimit.NewRateLimiter(cfg.RateLimit.RequestsPerSecond, float64(cfg.RateLimit.Burst))
 	ratelimit.StartCleanup(ctx, rateLimiter, cfg.RateLimit.CleanupInterval)
+	ratelimit.RunAdaptive(ctx, collector, rateLimiter, cfg.Adaptive)
 	// [SECURITY] Rate limiting is enforced at the HTTP edge so abusive clients are rejected before backend resources are consumed.
 	handler := rateLimiter.Middleware(proxyHandler)
 
@@ -110,4 +113,18 @@ func run(args []string) error {
 	}
 
 	return nil
+}
+
+func attachCircuitBreakers(backends []*pool.Backend, cfg config.CircuitBreakerConfig) {
+	for _, backend := range backends {
+		if backend == nil {
+			continue
+		}
+
+		backend.CircuitBreaker = circuit.NewCircuitBreaker(cfg)
+		if backend.URL != nil {
+			// [SECURITY] Breaker identity is pinned to the trusted backend URL so state logs cannot be spoofed by client input.
+			backend.CircuitBreaker.SetBackendName(backend.URL.String())
+		}
+	}
 }

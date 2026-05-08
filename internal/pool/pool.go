@@ -13,9 +13,9 @@ import (
 
 type BackendPool struct {
 	backends []*Backend
-	// [SECURITY] The backend slice is guarded by RWMutex because request routing and health checks read and mutate shared membership state.
+	// The backend slice is guarded by RWMutex because request routing and health checks read and mutate shared membership state.
 	mu sync.RWMutex
-	// [SECURITY] The request index uses atomic increments because selection happens concurrently for every request.
+	// The request index uses atomic increments because selection happens concurrently for every request.
 	index atomic.Uint64
 }
 
@@ -68,7 +68,7 @@ func (p *BackendPool) NextHealthy() (*Backend, error) {
 	start := int((p.index.Add(1) - 1) % uint64(len(weightedBackends)))
 	for i := 0; i < len(weightedBackends); i++ {
 		selected := weightedBackends[(start+i)%len(weightedBackends)]
-		if selected.Healthy.Load() {
+		if selected.Healthy.Load() && allowBackendRequest(selected) {
 			return selected, nil
 		}
 	}
@@ -163,6 +163,19 @@ func warmupMultiplier(level int32) int {
 	default:
 		return 4
 	}
+}
+
+func allowBackendRequest(backend *Backend) bool {
+	if backend == nil {
+		return false
+	}
+
+	if backend.CircuitBreaker == nil {
+		return true
+	}
+
+	// [SECURITY] Routing delegates admission to the breaker so open circuits can recover through bounded half-open probes instead of remaining permanently isolated.
+	return backend.CircuitBreaker.AllowRequest()
 }
 
 var _ http.Handler
