@@ -4,12 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/user/aegis/internal/circuit"
 	"github.com/user/aegis/internal/config"
 	logpkg "github.com/user/aegis/internal/logging"
@@ -18,6 +22,7 @@ import (
 	"github.com/user/aegis/internal/proxy"
 	"github.com/user/aegis/internal/ratelimit"
 	"github.com/user/aegis/internal/security"
+	"github.com/user/aegis/internal/tui"
 )
 
 const version = "0.1.0"
@@ -79,14 +84,15 @@ func run(args []string) error {
 		cfg.TUI.Enabled = false
 	}
 
-	if err := logpkg.ConfigureDefault(logpkg.Config{
+	eventBuffer := logpkg.NewEventBuffer(10)
+	if err := logpkg.ConfigureDefaultWithEvents(logpkg.Config{
 		Level:  cfg.Logging.Level,
 		Format: cfg.Logging.Format,
-	}); err != nil {
+	}, eventBuffer, logWriter(cfg.TUI.Enabled)); err != nil {
 		return fmt.Errorf("configure logger: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	collector := metrics.NewMetricsCollector(time.Minute, 1000)
@@ -129,11 +135,81 @@ func run(args []string) error {
 
 	slog.Info("aegis started", "port", cfg.Server.Port, "backends", len(backendPool.GetAll()))
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("listen and serve: %w", err)
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- fmt.Errorf("listen and serve: %w", err)
+			return
+		}
+
+		serverErr <- nil
+	}()
+
+	var program *tea.Program
+	tuiErr := make(chan error, 1)
+	if cfg.TUI.Enabled {
+		model := tui.NewModelWithEventSource(collector.Snapshot, eventBuffer.Events, cfg.TUI.RefreshInterval)
+		program = tea.NewProgram(model, tea.WithAltScreen())
+		go func() {
+			_, err := program.Run()
+			tuiErr <- err
+		}()
 	}
 
+	if err := waitForExit(ctx, cancel, serverErr, tuiErr, cfg.TUI.Enabled); err != nil {
+		if program != nil {
+			program.Quit()
+		}
+		return err
+	}
+
+	if program != nil {
+		program.Quit()
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	defer shutdownCancel()
+
+	// [SECURITY] Graceful shutdown stops accepting new connections before process exit, limiting partial request handling under operator interrupts.
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown server: %w", err)
+	}
+
+	slog.Info("Aegis shutdown complete")
 	return nil
+}
+
+func waitForExit(ctx context.Context, cancel context.CancelFunc, serverErr <-chan error, tuiErr <-chan error, tuiEnabled bool) error {
+	for {
+		select {
+		case err := <-serverErr:
+			cancel()
+			return err
+		case err := <-tuiErr:
+			if !tuiEnabled {
+				continue
+			}
+			if err == nil {
+				cancel()
+				return nil
+			}
+
+			tuiEnabled = false
+			// [SECURITY] A local terminal failure must not make the proxy unavailable or skip graceful server shutdown.
+			slog.Warn("tui failed; continuing headless", "error", err)
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func logWriter(tuiEnabled bool) io.Writer {
+	if tuiEnabled {
+		// [SECURITY] In alt-screen mode raw logs are captured in a bounded sanitized buffer and not written to the terminal sink.
+		return io.Discard
+	}
+
+	return os.Stdout
 }
 
 func attachCircuitBreakers(backends []*pool.Backend, cfg config.CircuitBreakerConfig) {
