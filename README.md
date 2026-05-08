@@ -1,99 +1,266 @@
-# Aegis
+# 🛡️ Aegis
 
-Aegis is a high-performance reverse proxy written in pure Go. It balances traffic across multiple upstream backends, applies per-client rate limiting, observes latency in real time, and isolates degraded upstreams with an internal circuit breaker. The project follows a zero-trust posture from startup validation through request handling and shutdown.
+A high-performance reverse proxy written in pure Go — weighted load balancing, adaptive rate limiting, per-backend circuit breakers, and a live terminal dashboard. Zero-trust posture from startup validation through graceful shutdown.
 
-The runtime is intentionally small and explicit. Aegis uses the Go standard library for HTTP serving and proxying, YAML for configuration, and Bubble Tea for the optional terminal dashboard. Every security-sensitive decision is documented in code with `// [SECURITY]` comments.
+![Go Version](https://img.shields.io/badge/go-1.22%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Race Free](https://img.shields.io/badge/race--detector-clean-brightgreen)
 
-## Architecture Diagram
+---
 
-```text
-Client → [Security Headers] → [Validation] → [Rate Limiter] → [Proxy]
-                                                                  ↓
-                                                         [Backend Pool]
-                                                      ↙      ↓      ↘
-                                                  Backend1 Backend2 Backend3
-                                                      ↑
-                                               [Health Checks] [Circuit Breaker]
-                                               [Metrics Collector] → [Adaptive Logic]
-                                                                       ↓
-                                                               [Adjust Rate Limit]
+## 📋 Table of Contents
+
+- [About](#-about)
+- [Architecture](#-architecture)
+- [Stack](#-stack)
+- [Security](#-security)
+- [Getting Started](#-getting-started)
+- [CLI](#-cli)
+- [Configuration](#-configuration)
+- [Development](#-development)
+- [Project Structure](#-project-structure)
+- [Architecture Decisions](#-architecture-decisions)
+- [License](#-license)
+
+---
+
+## 🎯 About
+
+**Aegis** is a production-grade reverse proxy demonstrating idiomatic Go patterns under real load:
+
+- Weighted round-robin backend selection with warm-up on recovery
+- Active health checks — one goroutine per backend with configurable thresholds
+- Per-IP token bucket rate limiting extracted exclusively from `RemoteAddr`
+- Adaptive control loop that adjusts rate limits based on observed P95 latency
+- Per-backend circuit breaker with `closed → open → half-open` state machine
+- Live terminal dashboard powered by Bubble Tea, updated every second
+- Eight independent security layers — if one fails, the rest keep the system safe
+
+Every security-sensitive decision is documented in code with `// [SECURITY]` comments.
+
+---
+
+## 🏗️ Architecture
+
+### Request Flow
+
+```mermaid
+flowchart LR
+    C[Client] --> SH[Security Headers]
+    SH --> VR[Validation]
+    VR --> RL[Rate Limiter]
+    RL --> PX[Proxy Handler]
+    PX --> BP[Backend Pool]
+    BP --> B1[Backend 1]
+    BP --> B2[Backend 2]
+    BP --> B3[Backend 3]
 ```
 
-## Features
+### Adaptive Control Loop
 
-- Reverse proxy based on `httputil.ReverseProxy`
-- Weighted round-robin backend selection
-- Active health checks with recovery warm-up
-- Per-IP token bucket rate limiting
-- Adaptive rate limiting driven by observed P95 latency
-- Per-backend circuit breaker with half-open probing
-- Live terminal dashboard powered by Bubble Tea
-- Eight independent security layers with zero-trust defaults
+```mermaid
+flowchart TD
+    T[Ticker — 10s] --> S[Collect Snapshot]
+    S --> P[Compute P95 across healthy backends]
+    P --> D{P95 > threshold?}
+    D -- yes --> R[rate × 0.8 — clamp to min]
+    D -- no --> G{P95 < threshold × 0.7?}
+    G -- yes --> V[rate × 1.1 — clamp to max]
+    G -- no --> N[No change]
+    R --> H[Hysteresis flag — skip next reduction]
+    V --> AP[Propagate new rate to all buckets]
+    N --> AP
+    H --> AP
+```
 
-## Installation
+### Circuit Breaker State Machine
 
-### Option 1: Build locally
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open : failure_threshold consecutive errors
+    Open --> HalfOpen : open_timeout elapsed
+    HalfOpen --> Closed : success_threshold probes succeed
+    HalfOpen --> Open : any probe fails
+```
+
+---
+
+## 🛠️ Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Go 1.22+ |
+| HTTP proxy | `net/http/httputil.ReverseProxy` (stdlib) |
+| Concurrency | `sync.Map`, `sync.RWMutex`, `atomic` (stdlib) |
+| Configuration | `gopkg.in/yaml.v3` |
+| Terminal UI | `github.com/charmbracelet/bubbletea` |
+| TUI styling | `github.com/charmbracelet/lipgloss` |
+| TUI components | `github.com/charmbracelet/bubbles` |
+| Logging | `log/slog` (stdlib, Go 1.21+) |
+
+Zero HTTP frameworks. Stdlib for everything except the TUI layer.
+
+---
+
+## 🔒 Security
+
+Aegis applies defense in depth across eight independent layers. A failure in any one layer does not compromise the others.
+
+### Layer 1 — Configuration Validation
+
+Runs once at startup. Fatal errors abort the process before any port is opened.
+
+- **Anti-SSRF:** resolves DNS for every backend URL and blocks loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), private ranges (`10/8`, `172.16/12`, `192.168/16`), IPv6 loopback (`::1`), and the AWS metadata endpoint (`169.254.169.254`). `// [SECURITY] SSRF Prevention`
+- Rejects schemes other than `http` or `https`
+- Rejects URLs with userinfo (`http://user:pass@host`)
+- Validates numeric ranges: port `1–65535`, all timeouts and thresholds positive, at least one backend configured
+
+### Layer 2 — Request Validation
+
+Applied per-request before any proxying occurs.
+
+| Check | Rejection |
+|---|---|
+| Body exceeds `max_body_bytes` | `413` |
+| Method not in allowlist | `405` |
+| Both `Content-Length` and `Transfer-Encoding` present | `400` — smuggling prevention |
+| Path contains `..` after `path.Clean()` | `400` — traversal prevention |
+| `Host` header not in backend whitelist | `400` — injection prevention |
+
+`// [SECURITY] Defense in Depth — request validation independent of rate limiter and circuit breaker`
+
+### Layer 3 — Security Headers
+
+Applied to every response regardless of backend behavior.
+
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 0
+Referrer-Policy: strict-origin-when-cross-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+Server: aegis
+```
+
+`X-Powered-By` is stripped from backend responses before forwarding to clients.
+
+### Layer 4 — Hop-by-hop Header Stripping
+
+Removed before forwarding to backends:
+
+```
+Connection  Keep-Alive  Proxy-Authenticate  Proxy-Authorization
+TE  Trailers  Transfer-Encoding  Upgrade
+```
+
+Headers listed in the `Connection` field of the incoming request are also removed. `// [SECURITY] Hop-by-hop Header Stripping — prevents header smuggling`
+
+### Layer 5 — Rate Limiting (per-IP, token bucket)
+
+- IP extracted **exclusively** from `net.SplitHostPort(req.RemoteAddr)` — never from `X-Forwarded-For` or any other header. `// [SECURITY] IP Spoofing prevention`
+- Excess requests return `429` with a JSON body and `Retry-After` header
+- Inactive buckets are purged on a configurable interval to prevent memory exhaustion. `// [SECURITY] Memory exhaustion prevention`
+
+### Layer 6 — Adaptive Rate Control
+
+- Evaluates P95 latency across all healthy backends every `evaluation_interval`
+- Reduces the global rate by `reduction_factor` when P95 exceeds the threshold
+- Recovers by `recovery_factor` when P95 drops 30% below the threshold
+- Hysteresis flag prevents back-to-back reductions, avoiding oscillation
+
+### Layer 7 — Circuit Breaker (per-backend)
+
+- Opens after `failure_threshold` consecutive real-request failures (HTTP 5xx or timeout)
+- Blocked backends receive no traffic in the open state — load balancer skips them entirely
+- Half-open probing allows `half_open_max_requests` test requests before deciding to close or re-open
+- Independent of health checks: health checks monitor `/health`, circuit breaker monitors real traffic
+
+### Layer 8 — Aggressive Timeouts
+
+```
+ReadTimeout:  5s   — Slowloris protection
+WriteTimeout: 10s  — Slow read protection
+IdleTimeout:  120s — Connection exhaustion protection
+```
+
+`ResponseHeaderTimeout` on the backend transport is also configurable. `// [SECURITY] Timeout Configuration — prevents resource exhaustion attacks`
+
+### Safe Logging
+
+- Client IPs are masked (last two octets zeroed) before any log entry
+- Request bodies, response bodies, cookies, tokens, and `Authorization` headers are never logged
+- Backend errors are logged internally with full detail; the client receives only `{"error":"bad gateway"}` with status `502`
+
+### Graceful Shutdown
+
+- Captures `SIGINT` / `SIGTERM`
+- Stops accepting new connections immediately
+- Drains in-flight requests up to `shutdown_timeout`
+- Cancels health check goroutines, rate limiter cleanup, metrics collector, and adaptive control loop via context propagation
+- Logs `INFO Aegis shutdown complete` on clean exit
+
+---
+
+## 🚀 Getting Started
+
+### 1. Clone the repository
 
 ```bash
-make build
+git clone https://github.com/devpedrois/aegis.git
+cd aegis
 ```
 
-The binary will be generated at `bin/aegis`.
-
-### Option 2: Install with Go
+### 2. Start fake backends
 
 ```bash
-go install github.com/user/aegis/cmd/aegis@latest
+go run scripts/fake_backend.go
 ```
 
-## Usage
+Three servers start on ports `8081`, `8082`, and `8083`, each responding `200 OK` with their own name.
 
-Run with the checked-in example configuration:
+### 3. Run the proxy
 
 ```bash
 make run
 ```
 
-Run in headless mode:
+The proxy listens on `8080` and distributes requests across the three backends. The TUI dashboard launches automatically.
+
+### 4. Send a request
 
 ```bash
-go run ./cmd/aegis -c aegis.yml --headless
+curl -s http://localhost:8080/
 ```
 
-Override the log level:
+### 5. Run in headless mode
 
 ```bash
-go run ./cmd/aegis -c aegis.yml --log-level debug
+make run-headless
 ```
 
-Show help:
+Structured JSON logs to stdout. No TUI.
 
-```bash
-go run ./cmd/aegis --help
-```
+---
 
-Show version:
-
-```bash
-go run ./cmd/aegis --version
-```
-
-## CLI
+## 💻 CLI
 
 ```text
 aegis [flags]
 
 Flags:
-  -c, --config string    Path to config file
-      --headless         Run without TUI
-      --log-level string Override log level
+  -c, --config string    Path to config file (default "aegis.yml")
+      --headless         Run without TUI (log only)
+      --log-level string Override log level (debug|info|warn|error)
   -h, --help             Show help
   -v, --version          Show version
 ```
 
-## Configuration
+---
 
-The project ships with `aegis.yml`:
+## ⚙️ Configuration
+
+The repository ships with a working `aegis.yml`:
 
 ```yaml
 server:
@@ -155,241 +322,184 @@ development:
 
 #### `server`
 
-- `port`
-  - TCP port used by the public proxy listener.
-  - Default: `8080`
-- `allowed_hosts`
-  - Optional public host whitelist enforced by request validation.
-  - Default: empty
-- `read_timeout`
-  - Maximum time to read a client request.
-  - Default: `5s`
-- `write_timeout`
-  - Maximum time to write a response to the client.
-  - Default: `10s`
-- `idle_timeout`
-  - Maximum keep-alive idle time.
-  - Default: `120s`
-- `max_header_bytes`
-  - Maximum accepted header size in bytes.
-  - Default: `8192`
-- `max_body_bytes`
-  - Maximum accepted request body size in bytes.
-  - Default: `10485760`
-- `shutdown_timeout`
-  - Grace period for graceful shutdown.
-  - Default: `30s`
+| Field | Description | Default |
+|---|---|---|
+| `port` | TCP port for the public listener | `8080` |
+| `read_timeout` | Max time to read a client request | `5s` |
+| `write_timeout` | Max time to write a response | `10s` |
+| `idle_timeout` | Max keep-alive idle time | `120s` |
+| `max_header_bytes` | Max accepted header size in bytes | `8192` |
+| `max_body_bytes` | Max accepted body size in bytes | `10485760` |
+| `shutdown_timeout` | Grace period for in-flight requests on shutdown | `30s` |
 
 #### `backends`
 
-- `url`
-  - Upstream backend URL.
-  - Required
-- `weight`
-  - Relative traffic weight in the round-robin schedule.
-  - Default expectation: positive integer
+| Field | Description | Required |
+|---|---|---|
+| `url` | Upstream backend URL | yes |
+| `weight` | Relative traffic weight in the round-robin schedule | yes |
 
 #### `health_check`
 
-- `interval`
-  - Delay between active health probes.
-  - Default: `10s`
-- `timeout`
-  - Timeout for each health probe.
-  - Default: `3s`
-- `path`
-  - Path used for active health checks.
-  - Default: `/health`
-- `unhealthy_threshold`
-  - Consecutive failures required to mark a backend unhealthy.
-  - Default: `3`
-- `healthy_threshold`
-  - Consecutive successes required to re-enable a backend.
-  - Default: `2`
+| Field | Description | Default |
+|---|---|---|
+| `interval` | Delay between active health probes | `10s` |
+| `timeout` | Timeout per health probe | `3s` |
+| `path` | Path used for active checks | `/health` |
+| `unhealthy_threshold` | Consecutive failures to mark a backend unhealthy | `3` |
+| `healthy_threshold` | Consecutive successes to re-enable a backend | `2` |
 
 #### `rate_limit`
 
-- `requests_per_second`
-  - Initial token refill rate per client IP.
-  - Default: `100`
-- `burst`
-  - Maximum bucket capacity per client IP.
-  - Default: `150`
-- `cleanup_interval`
-  - Frequency of stale bucket cleanup.
-  - Default: `60s`
+| Field | Description | Default |
+|---|---|---|
+| `requests_per_second` | Token refill rate per client IP | `100` |
+| `burst` | Max bucket capacity per client IP | `150` |
+| `cleanup_interval` | Frequency of stale bucket cleanup | `60s` |
 
 #### `adaptive`
 
-- `evaluation_interval`
-  - Frequency of adaptive rate evaluation.
-  - Default: `10s`
-- `latency_threshold_ms`
-  - P95 latency threshold that triggers reduction.
-  - Default: `500`
-- `reduction_factor`
-  - Multiplicative factor applied when latency is too high.
-  - Default: `0.8`
-- `recovery_factor`
-  - Multiplicative factor applied when latency recovers.
-  - Default: `1.1`
-- `min_rate`
-  - Lower bound for adaptive rate limiting.
-  - Default: `10`
-- `max_rate`
-  - Upper bound for adaptive rate limiting.
-  - Default: `500`
+| Field | Description | Default |
+|---|---|---|
+| `evaluation_interval` | How often the control loop evaluates P95 | `10s` |
+| `latency_threshold_ms` | P95 threshold that triggers a rate reduction | `500` |
+| `reduction_factor` | Multiplier applied when P95 is too high | `0.8` |
+| `recovery_factor` | Multiplier applied when P95 normalizes | `1.1` |
+| `min_rate` | Lower bound for adaptive rate | `10` |
+| `max_rate` | Upper bound for adaptive rate | `500` |
 
 #### `circuit_breaker`
 
-- `failure_threshold`
-  - Consecutive real request failures required to open a breaker.
-  - Default: `5`
-- `success_threshold`
-  - Successful half-open probes required to close a breaker.
-  - Default: `3`
-- `open_timeout`
-  - Time spent in the open state before half-open probing.
-  - Default: `30s`
-- `half_open_max_requests`
-  - Maximum concurrent probe budget in half-open state.
-  - Default: `3`
+| Field | Description | Default |
+|---|---|---|
+| `failure_threshold` | Consecutive failures to open a breaker | `5` |
+| `success_threshold` | Half-open successes required to close | `3` |
+| `open_timeout` | Time in open state before half-open probing | `30s` |
+| `half_open_max_requests` | Max concurrent probe requests in half-open | `3` |
 
 #### `logging`
 
-- `level`
-  - Log level for the structured logger.
-  - Default: `info`
-- `format`
-  - Output format. Supported values: `json`, `text`.
-  - Default: `json`
+| Field | Description | Default |
+|---|---|---|
+| `level` | Log level: `debug`, `info`, `warn`, `error` | `info` |
+| `format` | Output format: `json` or `text` | `json` |
 
 #### `tui`
 
-- `refresh_interval`
-  - Dashboard refresh cadence.
-  - Default: `1s`
-- `enabled`
-  - Enables the Bubble Tea dashboard.
-  - Default: `true`
+| Field | Description | Default |
+|---|---|---|
+| `refresh_interval` | Dashboard refresh cadence | `1s` |
+| `enabled` | Enable the Bubble Tea dashboard | `true` |
 
 #### `development`
 
-- `allow_loopback_backends`
-  - Development-only bypass that allows loopback upstreams after validation.
-  - Default: `false`
-  - The checked-in example sets this to `true` for local testing.
+| Field | Description | Default |
+|---|---|---|
+| `allow_loopback_backends` | Bypass SSRF check for loopback backends (local testing only) | `false` |
 
-## Security
+---
 
-Aegis uses eight independent layers:
-
-1. Configuration validation
-   - Validates numeric ranges and rejects invalid or empty backend sets.
-   - Resolves backend hosts and blocks loopback, private, link-local, metadata, and other reserved targets by default.
-
-2. Request validation
-   - Enforces body limits, method allowlists, host validation, path normalization, and request smuggling rejection.
-
-3. Security headers
-   - Applies `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, and a fixed `Server: aegis`.
-
-4. Rate limiting
-   - Uses per-IP token buckets keyed from `RemoteAddr` only.
-   - Rejects excess load with `429` and `Retry-After`.
-
-5. Circuit breaker
-   - Opens after repeated upstream failures.
-   - Prevents traffic from cascading into degraded backends.
-
-6. Aggressive timeouts
-   - Constrains read, write, idle, and upstream response windows to limit resource exhaustion.
-
-7. Safe logging
-   - Masks client IPs.
-   - Avoids request bodies, response bodies, cookies, tokens, and sensitive headers.
-
-8. Graceful shutdown
-   - Stops accepting new work, cancels background goroutines, and drains active requests within the configured timeout.
-
-## Architecture
-
-### `cmd/aegis`
-
-- Parses flags
-- Loads YAML configuration
-- Configures logging
-- Starts the proxy runtime
-- Handles graceful shutdown
-
-### `internal/config`
-
-- Defines config structures
-- Loads YAML with known-field validation
-- Validates startup constraints and backend SSRF rules
-
-### `internal/proxy`
-
-- Owns the reverse proxy handler
-- Rewrites upstream requests
-- Applies recovery and request logging
-- Measures upstream latency in the custom transport
-
-### `internal/pool`
-
-- Stores backend membership
-- Performs weighted round-robin selection
-- Runs active health checks
-- Tracks recovery warm-up state
-
-### `internal/ratelimit`
-
-- Implements token buckets
-- Tracks per-IP state
-- Cleans up idle buckets
-- Applies adaptive global rate changes
-
-### `internal/circuit`
-
-- Manages per-backend breaker state
-- Supports `closed`, `open`, and `half-open`
-
-### `internal/metrics`
-
-- Stores latency samples in sliding windows
-- Computes P50, P95, and P99
-- Exposes immutable snapshots for control and display
-
-### `internal/security`
-
-- Validates public requests
-- Applies security headers
-- Extracts trusted client IPs
-- Validates upstream targets against SSRF patterns
-
-### `internal/tui`
-
-- Renders the live dashboard
-- Displays backend status, latency, rate state, and recent events
-
-### `internal/logging`
-
-- Configures `slog`
-- Stores recent events for the TUI
-- Masks client IPs for operational safety
-
-## Development
-
-Useful commands:
+## 🧪 Development
 
 ```bash
-make build
-make test
-make race
-make lint
+make build        # Build binary to bin/aegis
+make run          # Run with TUI dashboard
+make run-headless # Run with log-only output
+make test         # go test -v ./...
+make race         # go test -race -count=1 ./...
+make lint         # go vet ./...
+```
+
+Run the stress test suite with the race detector:
+
+```bash
 go test -race -tags=stress ./test/
 ```
 
-## License
+---
 
-MIT
+## 📁 Project Structure
+
+```
+aegis/
+├── cmd/
+│   └── aegis/
+│       └── main.go                # Entry point — loads config, starts proxy or TUI
+├── internal/
+│   ├── config/
+│   │   ├── config.go              # Config structs and YAML parser
+│   │   └── validate.go            # Startup validation — ranges, SSRF, backend URLs
+│   ├── proxy/
+│   │   ├── proxy.go               # HTTP handler — dispatches to backend pool
+│   │   ├── director.go            # Director func — rewrites URL, strips hop-by-hop, sets X-Request-ID
+│   │   ├── transport.go           # Custom RoundTripper — latency measurement, error recording
+│   │   └── middleware.go          # Middleware chain — security headers, logging, recovery
+│   ├── pool/
+│   │   ├── pool.go                # BackendPool — thread-safe, weighted round-robin
+│   │   ├── backend.go             # Backend struct with atomic state fields
+│   │   └── healthcheck.go         # Per-backend health check goroutines with warm-up logic
+│   ├── ratelimit/
+│   │   ├── bucket.go              # TokenBucket — TryConsume, Refill, SetRate
+│   │   ├── limiter.go             # RateLimiter middleware — sync.Map of IP → bucket
+│   │   ├── adaptive.go            # Adaptive control loop — P95 evaluation and rate propagation
+│   │   └── cleanup.go             # Stale bucket GC goroutine
+│   ├── circuit/
+│   │   ├── breaker.go             # CircuitBreaker — AllowRequest, RecordSuccess, RecordFailure
+│   │   └── state.go               # State enum — Closed, Open, HalfOpen + transitions
+│   ├── metrics/
+│   │   ├── collector.go           # Latency sample collector — sliding window per backend
+│   │   ├── percentile.go          # P50 / P95 / P99 calculation
+│   │   └── snapshot.go            # MetricsSnapshot — immutable read for TUI and adaptive loop
+│   ├── security/
+│   │   ├── headers.go             # Security header middleware
+│   │   ├── validation.go          # Request validation middleware
+│   │   ├── ipcheck.go             # ExtractIP from RemoteAddr only
+│   │   └── ssrf.go                # IsPrivateIP + ValidateBackendURL
+│   ├── tui/
+│   │   ├── app.go                 # Bubble Tea Model — Init / Update / View
+│   │   ├── views.go               # Header, backends table, rate limiter panel, event log
+│   │   └── styles.go              # Lipgloss style constants
+│   └── logging/
+│       └── logger.go              # slog setup, IP masking, recent event ring buffer
+├── test/
+│   ├── proxy_test.go              # End-to-end proxy integration tests
+│   ├── pool_test.go               # Backend pool and health check tests
+│   ├── ratelimit_test.go          # Token bucket and adaptive tests
+│   ├── circuit_test.go            # Circuit breaker state transition tests
+│   ├── security_test.go           # Adversarial security tests
+│   ├── helpers_test.go            # Fake backends with configurable latency and error rate
+│   └── testdata/
+│       ├── valid_config.yml
+│       └── invalid_config.yml
+├── scripts/
+│   └── fake_backend.go            # Three fake HTTP backends for local testing
+├── aegis.yml                      # Example configuration
+├── Makefile
+└── go.mod
+```
+
+---
+
+## 🧠 Architecture Decisions
+
+**`httputil.ReverseProxy` as the base** — The stdlib proxy handles HTTP/1.1 and HTTP/2 transparently, manages connection pooling via `http.Transport`, and exposes `Director` and `ModifyResponse` hooks for customization. Building on it avoids reimplementing protocol details while keeping full control over request rewriting and response transformation.
+
+**Weighted round-robin with atomic counters** — Backend selection uses an atomic index over an expanded slice where each backend appears `weight` times. No locks on the hot path. Unhealthy and open-circuit backends are filtered before selection, not removed from the slice, so recovery requires no structural mutation.
+
+**Warm-up on recovery** — A backend returning from unhealthy does not immediately receive its full share of traffic. Weight scales from 25% to 50% to 75% to 100% across consecutive successful health checks. This prevents a recovering backend from being overwhelmed before it stabilizes.
+
+**Sliding window percentiles** — Latency samples are stored in a ring buffer capped at 1000 entries or 60 seconds, whichever is smaller. P95 is computed by sorting the window copy. Accuracy is sufficient for the adaptive control loop without the complexity of streaming estimators like t-digest.
+
+**Hysteresis in the adaptive loop** — A flag prevents two consecutive reductions in the same evaluation cycle. After a reduction, the loop waits at least one full interval before reducing again, even if P95 remains high. This prevents a feedback spiral when the system is under transient load.
+
+**`sync.Map` for IP buckets** — The bucket map is read far more than it is written. `sync.Map` amortizes the cost of concurrent reads with minimal contention. Each bucket uses its own `sync.Mutex` for the token accounting, keeping lock scope minimal.
+
+**Circuit breaker independent of health checks** — Health checks probe a synthetic `/health` endpoint on a timer. The circuit breaker observes real traffic. A backend can pass health checks while its circuit is open (e.g., the health endpoint returns 200 but application endpoints return 500). Both layers must agree before traffic resumes.
+
+**Context propagation throughout** — Every goroutine started by Aegis receives a `context.Context` derived from the root context. Canceling the root context on shutdown propagates to health check tickers, the rate limiter cleanup loop, the adaptive control loop, and the metrics collector. No goroutine leaks on clean shutdown.
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
