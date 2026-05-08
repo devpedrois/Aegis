@@ -95,6 +95,26 @@ func run(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	return runWithContext(ctx, cancel, cfg, eventBuffer)
+}
+
+func runWithContext(ctx context.Context, cancel context.CancelFunc, cfg *config.Config, eventBuffer *logpkg.EventBuffer) error {
+	if ctx == nil {
+		return fmt.Errorf("context must not be nil")
+	}
+
+	if cancel == nil {
+		cancel = func() {}
+	}
+
+	if cfg == nil {
+		return fmt.Errorf("config must not be nil")
+	}
+
+	if eventBuffer == nil {
+		eventBuffer = logpkg.NewEventBuffer(10)
+	}
+
 	collector := metrics.NewMetricsCollector(time.Minute, 1000)
 	backendPool, err := pool.NewPool(cfg.Backends, proxy.NewDirector, proxy.NewInstrumentedTransportFactory(collector))
 	if err != nil {

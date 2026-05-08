@@ -56,7 +56,13 @@ func MaskIP(ip string) string {
 		return fmt.Sprintf("%d.%d.x.x", ipv4[0], ipv4[1])
 	}
 
-	return ip
+	parts := strings.Split(parsedIP.String(), ":")
+	if len(parts) >= 2 {
+		// [SECURITY] IPv6 client addresses are reduced to the first two segments so logs avoid storing full client identifiers.
+		return parts[0] + ":" + parts[1] + ":x:x:x:x:x:x"
+	}
+
+	return "masked"
 }
 
 func parseLevel(rawLevel string) (slog.Level, error) {

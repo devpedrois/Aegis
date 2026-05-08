@@ -23,6 +23,14 @@ func TestMaskIPKeepsNonIPv4InputsStable(t *testing.T) {
 	}
 }
 
+func TestMaskIPMasksIPv6Segments(t *testing.T) {
+	t.Parallel()
+
+	if got := MaskIP("2001:db8:abcd:ef01:2345:6789:abcd:ef01"); got != "2001:db8:x:x:x:x:x:x" {
+		t.Fatalf("MaskIP() = %q, want masked IPv6 prefix", got)
+	}
+}
+
 func TestNewLoggerRejectsUnknownFormat(t *testing.T) {
 	t.Parallel()
 
