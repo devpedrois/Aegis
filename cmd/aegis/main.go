@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,17 +12,20 @@ import (
 
 	"github.com/user/aegis/internal/circuit"
 	"github.com/user/aegis/internal/config"
+	logpkg "github.com/user/aegis/internal/logging"
 	"github.com/user/aegis/internal/metrics"
 	"github.com/user/aegis/internal/pool"
 	"github.com/user/aegis/internal/proxy"
 	"github.com/user/aegis/internal/ratelimit"
+	"github.com/user/aegis/internal/security"
 )
 
 const version = "0.1.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
@@ -76,6 +79,13 @@ func run(args []string) error {
 		cfg.TUI.Enabled = false
 	}
 
+	if err := logpkg.ConfigureDefault(logpkg.Config{
+		Level:  cfg.Logging.Level,
+		Format: cfg.Logging.Format,
+	}); err != nil {
+		return fmt.Errorf("configure logger: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -95,7 +105,18 @@ func run(args []string) error {
 	ratelimit.StartCleanup(ctx, rateLimiter, cfg.RateLimit.CleanupInterval)
 	ratelimit.RunAdaptive(ctx, collector, rateLimiter, cfg.Adaptive)
 	// [SECURITY] Rate limiting is enforced at the HTTP edge so abusive clients are rejected before backend resources are consumed.
-	handler := rateLimiter.Middleware(proxyHandler)
+	handler := security.SecurityHeaders(
+		proxy.RequestLogger(
+			proxy.Recovery(
+				security.ValidateRequest(security.RequestValidationConfig{
+					MaxBodyBytes: cfg.Server.MaxBodyBytes,
+					AllowedHosts: cfg.Server.AllowedHosts,
+				})(
+					rateLimiter.Middleware(proxyHandler),
+				),
+			),
+		),
+	)
 
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.Server.Port),
@@ -106,7 +127,7 @@ func run(args []string) error {
 		MaxHeaderBytes: cfg.Server.MaxHeaderBytes, // [SECURITY] Header size is capped to reduce request abuse.
 	}
 
-	log.Printf("Aegis started on :%d with %d backends", cfg.Server.Port, len(backendPool.GetAll()))
+	slog.Info("aegis started", "port", cfg.Server.Port, "backends", len(backendPool.GetAll()))
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("listen and serve: %w", err)

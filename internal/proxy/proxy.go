@@ -25,5 +25,10 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if backend != nil && backend.URL != nil {
+		// [SECURITY] Backend identity is attached as internal response metadata for trusted logging and stripped before the client response is finalized.
+		w.Header().Set("X-Aegis-Backend", backend.URL.String())
+	}
+
 	backend.Proxy.ServeHTTP(w, r)
 }
